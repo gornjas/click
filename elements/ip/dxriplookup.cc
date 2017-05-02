@@ -42,7 +42,8 @@ DXRIPLookup::DXRIPLookup()
 	_aggr_fragments_short(0), _aggr_fragments_long(0),
 	_updates_pending(0), _pending_start(DIRECT_TBL_SIZE),
 	_pending_end(0), _update_scanner(this),
-	_bench_sel(0), _bench_threads(1), _key_tbl(NULL), _nh_tbl(NULL)
+	_bench_sel(0), _bench_threads(1), _skip_smt(0),
+	_key_tbl(NULL), _nh_tbl(NULL)
 {
 	int i;
 
@@ -97,6 +98,7 @@ DXRIPLookup::add_handlers()
 	add_write_handler("bench_sel", bench_select, 0, Handler::BUTTON);
 	add_write_handler("prepare", prepare_handler, 0, Handler::BUTTON);
 	add_write_handler("threads", thread_select, 0, Handler::BUTTON);
+	add_write_handler("skip_smt", skip_smt, 0, Handler::BUTTON);
 }
 
 
@@ -1110,6 +1112,21 @@ DXRIPLookup::bench_select(const String &s, Element *e, void *,
 
 
 int
+DXRIPLookup::skip_smt(const String &s, Element *e, void *,
+    ErrorHandler *)
+{
+	DXRIPLookup *t = static_cast<DXRIPLookup *>(e);
+	int type;
+
+	type = atoi(s.c_str());
+	if (type < 0 || type > 1)
+		return (-ERANGE);
+	t->_skip_smt = type;
+	return (0);
+}
+
+
+int
 DXRIPLookup::thread_select(const String &s, Element *e, void *,
     ErrorHandler *)
 {
@@ -1132,6 +1149,7 @@ DXRIPLookup::thread_select(const String &s, Element *e, void *,
 	if (n < 1 || n > ncpus)
 		return (-ERANGE);
 	t->_bench_threads = n;
+	t->_ncpus = ncpus;
 	return (0);
 }
 
@@ -1235,7 +1253,7 @@ DXRIPLookup::bench_handler(Element *e, void *)
 {
 	DXRIPLookup *t = static_cast<DXRIPLookup *>(e);
 	StringAccum sa;
-	int i, time_ms;
+	int i, time_ms, cpu;
 	uint64_t klps, len = t->_test_blk;
 	struct bench_info bi[16];
 	Timestamp t_len;
@@ -1261,7 +1279,13 @@ DXRIPLookup::bench_handler(Element *e, void *)
 		    (void *) &bi[i]) == -1)
 			err(EX_OSERR, "Can't start RX threads");
 		CPU_ZERO(&cpuset);
-		CPU_SET(i, &cpuset);
+		if (t->_skip_smt) {
+			cpu = i * 2;
+			if (cpu >= t->_ncpus)
+				cpu = cpu % t->_ncpus + 1;
+		} else
+			cpu = i;
+		CPU_SET(cpu, &cpuset);
 		if (pthread_setaffinity_np(bi[i].td, sizeof(cpuset),
 		    &cpuset) != 0)
 			err(EX_OSERR, "pthread_setaffinity_np() failed");

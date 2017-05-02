@@ -224,6 +224,8 @@ class DXRIPLookup : public BSDIPLookup {
 
 	int _bench_sel;
 	int _bench_threads;
+	int _skip_smt;
+	int _ncpus;
 	size_t _test_blk;
 	uint32_t *_key_tbl;
 	uint16_t *_nh_tbl;
@@ -247,6 +249,8 @@ class DXRIPLookup : public BSDIPLookup {
 	static int bench_select(const String &, Element *, void *, 
 	    ErrorHandler *);
 	static int thread_select(const String &, Element *, void *,
+	    ErrorHandler *);
+	static int skip_smt(const String &, Element *, void *,
 	    ErrorHandler *);
 	static int prepare_handler(const String &, Element *, void *,
 	    ErrorHandler *);
