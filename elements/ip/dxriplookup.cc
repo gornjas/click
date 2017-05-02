@@ -30,6 +30,8 @@
 #include <sysexits.h>
 #include <unistd.h>
 
+#define	UNROLL_LOOKUP
+
 CLICK_DECLS
 
 
@@ -925,6 +927,7 @@ DXRIPLookup::lookup_nexthop(uint32_t dst) const
 
 			do {
 				DXR_LOOKUP_STAGE
+#ifdef UNROLL_LOOKUP
 				DXR_LOOKUP_STAGE
 				DXR_LOOKUP_STAGE
 				DXR_LOOKUP_STAGE
@@ -936,6 +939,7 @@ DXRIPLookup::lookup_nexthop(uint32_t dst) const
 				DXR_LOOKUP_STAGE
 				DXR_LOOKUP_STAGE
 				DXR_LOOKUP_STAGE
+#endif
 			} while (1);
 			nh = range[lowerbound].nexthop;
 		} else {
@@ -949,6 +953,7 @@ DXRIPLookup::lookup_nexthop(uint32_t dst) const
 
 			do {
 				DXR_LOOKUP_STAGE
+#ifdef UNROLL_LOOKUP
 				DXR_LOOKUP_STAGE
 				DXR_LOOKUP_STAGE
 				DXR_LOOKUP_STAGE
@@ -956,6 +961,7 @@ DXRIPLookup::lookup_nexthop(uint32_t dst) const
 				DXR_LOOKUP_STAGE
 				DXR_LOOKUP_STAGE
 				DXR_LOOKUP_STAGE
+#endif
 			} while (1);
 			nh = range[lowerbound].nexthop;
 		}
@@ -1091,6 +1097,9 @@ DXRIPLookup::bench_select(const String &s, Element *e, void *,
 		CLICK_LFREE(t->_key_tbl, sizeof(*t->_key_tbl) * t->_test_blk);
 	if (t->_nh_tbl != NULL)
 		CLICK_LFREE(t->_nh_tbl, sizeof(*t->_nh_tbl) * t->_test_blk);
+	t->_key_tbl = NULL;
+	t->_nh_tbl = NULL;
+	t->_test_blk = 0;
 
 	type = atoi(s.c_str());
 	if (type < 0 || type > 5)
@@ -1190,8 +1199,14 @@ DXRIPLookup::prepare_handler(const String &s, Element *e, void *,
 		CLICK_LFREE(t->_key_tbl, sizeof(*t->_key_tbl) * t->_test_blk);
 	if (t->_nh_tbl != NULL)
 		CLICK_LFREE(t->_nh_tbl, sizeof(*t->_nh_tbl) * t->_test_blk);
+	t->_key_tbl = NULL;
+	t->_nh_tbl = NULL;
+	t->_test_blk = 0;
 
 	n = atoi(s.c_str());
+	if (n < 1 || n > 1024)
+		return (ERANGE);
+
 	t->_test_blk = n * 1024 * 1024;
 
 	t->_key_tbl =
