@@ -1105,12 +1105,12 @@ DXRIPLookup::thread_select(const String &s, Element *e, void *,
 	cpuset_t cpuset;
 
 	n = atoi(s.c_str());
-        if (pthread_getaffinity_np(pthread_self(), sizeof(cpuset), &cpuset)
+	if (pthread_getaffinity_np(pthread_self(), sizeof(cpuset), &cpuset)
 	    != 0)
 		err(EX_OSERR, "pthread_getaffinity_np() failed");
 	for (ncpus = 0, i = 0; i < CPU_SETSIZE; i++)
 		if (CPU_ISSET(i, &cpuset))
-                        ncpus++;
+			ncpus++;
 
 	if (n < 1 || n > ncpus)
 		return (-ERANGE);
