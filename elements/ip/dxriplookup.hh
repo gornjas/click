@@ -224,6 +224,9 @@ class DXRIPLookup : public BSDIPLookup {
 
 	int _bench_sel;
 	int _bench_threads;
+	size_t _test_blk;
+	uint32_t *_key_tbl;
+	uint16_t *_nh_tbl;
 
 	int lookup_nexthop(uint32_t) const;
 	void schedule_update(const IPRoute &);
@@ -244,6 +247,8 @@ class DXRIPLookup : public BSDIPLookup {
 	static int bench_select(const String &, Element *, void *, 
 	    ErrorHandler *);
 	static int thread_select(const String &, Element *, void *,
+	    ErrorHandler *);
+	static int prepare_handler(const String &, Element *, void *,
 	    ErrorHandler *);
 	void bench_seq(uint32_t *, uint16_t *, uint32_t);
 	void bench_rnd(uint32_t *, uint16_t *, uint32_t);

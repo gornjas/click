@@ -21,7 +21,9 @@
 #include <click/straccum.hh>
 #include "dxriplookup.hh"
 
-#include <pthread.h>
+#include <err.h>
+#include <pthread_np.h>
+#include <sysexits.h>
 #include <unistd.h>
 
 CLICK_DECLS
@@ -33,8 +35,8 @@ DXRIPLookup::DXRIPLookup()
 	_fragments_long(0), _aggr_chunks_short(0), _aggr_chunks_long(0),
 	_aggr_fragments_short(0), _aggr_fragments_long(0),
 	_updates_pending(0), _pending_start(DIRECT_TBL_SIZE),
-	_pending_end(0), _update_scanner(this), _bench_sel(0),
-	_bench_threads(1)
+	_pending_end(0), _update_scanner(this),
+	_bench_sel(0), _bench_threads(1), _key_tbl(NULL), _nh_tbl(NULL)
 {
 	int i;
 
@@ -87,6 +89,7 @@ DXRIPLookup::add_handlers()
 	add_read_handler("stat", status_handler, 0, Handler::BUTTON);
 	add_read_handler("bench", bench_handler, 0, Handler::BUTTON);
 	add_write_handler("bench_sel", bench_select, 0, Handler::BUTTON);
+	add_write_handler("prepare", prepare_handler, 0, Handler::BUTTON);
 	add_write_handler("threads", thread_select, 0, Handler::BUTTON);
 }
 
@@ -1019,7 +1022,7 @@ DXRIPLookup::status_handler(Element *e, void *)
 		if (size > max_chunk)
 			max_chunk = size;
 		for (j = 1; (1 << j) < FRAG_MAX; j++)
-			if (size < (1 << j)) {
+			if (size < ((uint32_t) 1 << j)) {
 				chunk_sizes[j]++;
 				break;
 			}
@@ -1080,6 +1083,11 @@ DXRIPLookup::bench_select(const String &s, Element *e, void *,
 	DXRIPLookup *t = static_cast<DXRIPLookup *>(e);
 	int type;
 
+	if (t->_key_tbl != NULL)
+		CLICK_LFREE(t->_key_tbl, sizeof(*t->_key_tbl) * t->_test_blk);
+	if (t->_nh_tbl != NULL)
+		CLICK_LFREE(t->_nh_tbl, sizeof(*t->_nh_tbl) * t->_test_blk);
+
 	type = atoi(s.c_str());
 	if (type < 0 || type > 5)
 		return (-ERANGE);
@@ -1093,10 +1101,18 @@ DXRIPLookup::thread_select(const String &s, Element *e, void *,
     ErrorHandler *)
 {
 	DXRIPLookup *t = static_cast<DXRIPLookup *>(e);
-	int n;
+	int i, n, ncpus;
+	cpuset_t cpuset;
 
 	n = atoi(s.c_str());
-	if (n < 1 || n > 16)
+        if (pthread_getaffinity_np(pthread_self(), sizeof(cpuset), &cpuset)
+	    != 0)
+		err(EX_OSERR, "pthread_getaffinity_np() failed");
+	for (ncpus = 0, i = 0; i < CPU_SETSIZE; i++)
+		if (CPU_ISSET(i, &cpuset))
+                        ncpus++;
+
+	if (n < 1 || n > ncpus)
 		return (-ERANGE);
 	t->_bench_threads = n;
 	return (0);
@@ -1121,6 +1137,8 @@ bench_trampoline(void *arg)
 	struct bench_info *bi = (struct bench_info *) arg;
 
 	bi->t->bench_thread(bi);
+
+	return (NULL); // Appease compiler warnings
 }
 
 
@@ -1133,7 +1151,7 @@ DXRIPLookup::bench_thread(void *arg)
 	Timestamp t_start;
 	uint32_t off;
 
-	off = ((TEST_BLK / bi->t->_bench_threads) & ~0xf) * bi->id;
+	off = ((bi->t->_test_blk / bi->t->_bench_threads) & ~0xf) * bi->id;
 	/* Do the benchmark */
 	t_start = Timestamp::now();
 	switch (_bench_sel % 3) {
@@ -1152,45 +1170,73 @@ DXRIPLookup::bench_thread(void *arg)
 }
 
 
+int
+DXRIPLookup::prepare_handler(const String &s, Element *e, void *,
+    ErrorHandler *)
+{
+	DXRIPLookup *t = static_cast<DXRIPLookup *>(e);
+	int n, key;
+	size_t i;
+
+	if (t->_key_tbl != NULL)
+		CLICK_LFREE(t->_key_tbl, sizeof(*t->_key_tbl) * t->_test_blk);
+	if (t->_nh_tbl != NULL)
+		CLICK_LFREE(t->_nh_tbl, sizeof(*t->_nh_tbl) * t->_test_blk);
+
+	n = atoi(s.c_str());
+	t->_test_blk = n * 1024 * 1024;
+
+	t->_key_tbl =
+	    (uint32_t *) CLICK_LALLOC(sizeof(*t->_key_tbl) * t->_test_blk);
+	t->_nh_tbl =
+	    (uint16_t *) CLICK_LALLOC(sizeof(*t->_nh_tbl) * t->_test_blk);
+	assert(t->_key_tbl != NULL);
+	assert(t->_nh_tbl != NULL);
+
+	/* Populate input vector with random keys */
+	for (i = 0; i < t->_test_blk; i++) {
+		/* Exclude unannounced address space for tests 3, 4 and 5 */
+		do {
+			key = random();
+		} while (t->_bench_sel > 3 && t->lookup_nexthop(key) == 0);
+		t->_key_tbl[i] = key;
+		/* map the memory for the results now, not during the test */
+		t->_nh_tbl[i] = key;
+	}
+
+	return (0);
+}
+
 String
 DXRIPLookup::bench_handler(Element *e, void *)
 {
 	DXRIPLookup *t = static_cast<DXRIPLookup *>(e);
 	StringAccum sa;
-	uint32_t *key_tbl;
-	uint16_t *nh_tbl;
-	int i, key, time_ms;
-	uint64_t klps, len = TEST_BLK;
+	int i, time_ms;
+	uint64_t klps, len = t->_test_blk;
 	struct bench_info bi[16];
+	cpuset_t cpuset;
 	Timestamp t_len;
 
-	key_tbl = (uint32_t *) CLICK_LALLOC(sizeof(*key_tbl) * TEST_BLK);
-	nh_tbl = (uint16_t *) CLICK_LALLOC(sizeof(*nh_tbl) * TEST_BLK);
-	assert(key_tbl != NULL);
-	assert(nh_tbl != NULL);
-	
-	/* Populate input vector with random keys */
-	printf("%s: preparing random keys, please wait...\n", __FUNCTION__);
-	for (i = 0; i < TEST_BLK; i++) {
-		/* Exclude unannounced address space for tests 3, 4 and 5 */
-		do {
-			key = random();
-		} while (t->_bench_sel > 3 && t->lookup_nexthop(key) == 0);
-		key_tbl[i] = key;
-		/* map the memory for the results now, not during the test */
-		nh_tbl[i] = key;
+	if (t->_key_tbl == NULL || t->_nh_tbl == NULL) {
+		sa << "ERROR: key stream uninitialized\n";
+		return (sa.take_string());
 	}
-	printf("Keys prepared, starting %d worker thread(s)...\n",
-	    t->_bench_threads);
 
 	for (i = 0; i < t->_bench_threads; i++) {
 		bi[i].t = t;
 		bi[i].id = i;
-		bi[i].key_tbl = key_tbl;
-		bi[i].nh_tbl = nh_tbl;
+		bi[i].key_tbl = t->_key_tbl;
+		bi[i].nh_tbl = t->_nh_tbl;
 		bi[i].done = 0;
-		pthread_create(&bi[i].td, NULL, bench_trampoline,
-		    (void *) &bi[i]);
+		if (pthread_create(&bi[i].td, NULL, bench_trampoline,
+		    (void *) &bi[i]) == -1)
+			err(EX_OSERR, "Can't start RX threads");
+		CPU_ZERO(&cpuset);
+		CPU_SET(i, &cpuset);
+		if (pthread_setaffinity_np(bi[i].td, sizeof(cpuset),
+		    &cpuset) != 0)
+			err(EX_OSERR, "pthread_setaffinity_np() failed");
 	}
 
 	do {
@@ -1206,8 +1252,6 @@ DXRIPLookup::bench_handler(Element *e, void *)
 	t_len = t_len / t->_bench_threads;
 	time_ms = t_len.sec() * 1000 + t_len.usec() / 1000;
 	klps = len * t->_bench_threads / time_ms;
-	printf("Benchmark completed in %d s %d ms.\n", t_len.sec(),
-	    t_len.msec());
 
 	sa << t->class_name() << " (D" << DXR_DIRECT_BITS << "R), ";
 	switch (t->_bench_sel % 3) {
@@ -1228,8 +1272,6 @@ DXRIPLookup::bench_handler(Element *e, void *)
 	sa << len * t->_bench_threads << " lookups in " << t_len << " s (";
 	sa << klps / 1000 << "." << (klps % 1000) / 100 << " MLps)\n";
 
-	CLICK_LFREE(key_tbl, sizeof(*key_tbl) * TEST_BLK);
-	CLICK_LFREE(nh_tbl, sizeof(*nh_tbl) * TEST_BLK);
 	return (sa.take_string());
 }
 
@@ -1238,7 +1280,7 @@ void
 DXRIPLookup::bench_seq(uint32_t *key_tbl, uint16_t *nh_tbl, uint32_t offset)
 {
 	int nh = 0;
-	int size = TEST_BLK;
+	int size = _test_blk;
 	uint32_t *key_ptr;
 	uint16_t *nh_ptr;
 
@@ -1252,7 +1294,7 @@ DXRIPLookup::bench_seq(uint32_t *key_tbl, uint16_t *nh_tbl, uint32_t offset)
 		key_ptr = &key_tbl[offset];
 		nh_ptr = &nh_tbl[offset];
 		offset += 8;
-		if (offset >= TEST_BLK)
+		if (offset >= _test_blk)
 			offset = 0;
 		/* Manual unrolling for better throughput */
 		SEQ_STAGE; SEQ_STAGE; SEQ_STAGE; SEQ_STAGE;
@@ -1265,7 +1307,7 @@ DXRIPLookup::bench_seq(uint32_t *key_tbl, uint16_t *nh_tbl, uint32_t offset)
 void
 DXRIPLookup::bench_rnd(uint32_t *key_tbl, uint16_t *nh_tbl, uint32_t offset)
 {
-	int size = TEST_BLK;
+	int size = _test_blk;
 	uint32_t *key_ptr;
 	uint16_t *nh_ptr;
 
@@ -1275,7 +1317,7 @@ DXRIPLookup::bench_rnd(uint32_t *key_tbl, uint16_t *nh_tbl, uint32_t offset)
 		key_ptr = &key_tbl[offset];
 		nh_ptr = &nh_tbl[offset];
 		offset += 8;
-		if (offset >= TEST_BLK)
+		if (offset >= _test_blk)
 			offset = 0;
 		/* Manual unrolling for better throughput */
 		RND_STAGE; RND_STAGE; RND_STAGE; RND_STAGE;
@@ -1288,7 +1330,7 @@ DXRIPLookup::bench_rnd(uint32_t *key_tbl, uint16_t *nh_tbl, uint32_t offset)
 void
 DXRIPLookup::bench_rep(uint32_t *key_tbl, uint16_t *nh_tbl, uint32_t offset)
 {
-	int size = TEST_BLK;
+	int size = _test_blk;
 	uint32_t *key_ptr;
 	uint16_t *nh_ptr;
 
@@ -1296,7 +1338,7 @@ DXRIPLookup::bench_rep(uint32_t *key_tbl, uint16_t *nh_tbl, uint32_t offset)
 		key_ptr = &key_tbl[offset];
 		nh_ptr = &nh_tbl[offset];
 		offset += 1; /* Reuse same key 8 times */
-		if (offset >= TEST_BLK - 8)
+		if (offset >= _test_blk - 8)
 			offset = 0;
 		/* Manual unrolling for better throughput */
 		RND_STAGE; RND_STAGE; RND_STAGE; RND_STAGE;
