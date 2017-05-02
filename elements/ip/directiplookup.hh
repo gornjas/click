@@ -1,7 +1,11 @@
 // -*- c-basic-offset: 4 -*-
 #ifndef CLICK_DIRECTIPLOOKUP_HH
 #define CLICK_DIRECTIPLOOKUP_HH
-#include "iproutetable.hh"
+#include "bsdiplookup.hh"
+#include <click/timer.hh>
+
+#include <pthread.h>
+
 CLICK_DECLS
 
 /*
@@ -70,123 +74,109 @@ Clears the entire routing table in a single atomic operation.
 See IPRouteTable for a performance comparison of the various IP routing
 elements.
 
-DirectIPLookup's data structures are inherently limited: at most 2^16 /24
+DirectIPLookup's data structures are inherently limited: at most 2^15 /24
 networks can contain routes for /25-or-smaller subnetworks, no matter how much
-memory you have.  If you need more than this, try RangeIPLookup.
+memory you have.  If you need more than this, try BSDIPLookup, DXRIPLookup
+or RadixIPLookup.
 
-=a IPRouteTable, RangeIPLookup, RadixIPLookup, StaticIPLookup, LinearIPLookup,
-SortedIPLookup, LinuxIPLookup
+=a IPRouteTable, BSDIPLookup, DXRIPLookup, RadixIPLookup, StaticIPLookup,
+LinearIPLookup, SortedIPLookup, LinuxIPLookup
 
 Pankaj Gupta, Steven Lin, and Nick McKeown.  "Routing Lookups in Hardware at
 Memory Access Speeds".  In Proc. IEEE Infocom 1998, Vol. 3, pp. 1240-1247.
 
 */
 
-class RangeIPLookup;
 
-class DirectIPLookup : public IPRouteTable { public:
+#define	DIRECT_BITS 24
+#define	SECONDARY_BITS (32 - DIRECT_BITS)
+#define	PRIMARY_SIZE (1 << DIRECT_BITS)
+#define	SECONDARY_SIZE ((1 << SECONDARY_BITS) * (1 << 15))
+#define	SECONDARY_MASK ((1 << SECONDARY_BITS) - 1)
 
-    DirectIPLookup() CLICK_COLD;
-    ~DirectIPLookup() CLICK_COLD;
+#define	DIR_CHUNK_PREFLEN 16
+#define	DIR_CHUNKS	(1 << DIR_CHUNK_PREFLEN)
+#define	DIR_CHUNK_SHIFT	(32 - DIR_CHUNK_PREFLEN)
+#define	DIR_CHUNK_MASK	((1 << DIR_CHUNK_SHIFT) - 1)
 
-    const char *class_name() const	{ return "DirectIPLookup"; }
-    const char *port_count() const	{ return "1/-"; }
-    const char *processing() const	{ return PUSH; }
 
-    int configure(Vector<String> &conf, ErrorHandler *errh) CLICK_COLD;
-    void cleanup(CleanupStage stage) CLICK_COLD;
-    void add_handlers() CLICK_COLD;
+class DirectIPLookup : public BSDIPLookup {
+    public:
+	DirectIPLookup();
+	~DirectIPLookup();
 
-    void push(int port, Packet* p);
+	const char *class_name() const	{ return "DirectIPLookup"; }
+	const char *port_count() const	{ return "-/-"; }
+	const char *processing() const	{ return PUSH; }
 
-    int add_route(const IPRoute&, bool, IPRoute*, ErrorHandler *);
-    int remove_route(const IPRoute&, IPRoute*, ErrorHandler *);
-    int lookup_route(IPAddress, IPAddress&) const;
-    String dump_routes();
-
-    static int flush_handler(const String &, Element *, void *, ErrorHandler *);
-
-    enum {
-	RT_SIZE_MAX = 256 * 1024, // accomodate a full BGP view and more
-	tbl_24_31_capacity_limit = 32768 * 256,
-	vport_capacity_limit = 32768,
-	PREF_HASHSIZE = 64 * 1024, // must be a power of 2!
-	DISCARD_PORT = -1
-    };
-
-    struct CleartextEntry {
-	int ll_next;
-	int ll_prev;
-	uint32_t prefix;
-	uint16_t plen;
-	int16_t vport;
-    };
-
-    struct VirtualPort {
-	int16_t ll_next;
-	int16_t ll_prev;
-	int32_t refcount;
-	IPAddress gw;
-	int16_t port;
-	int16_t padding;
-    };
-
-    struct Table {
-	// Structures used for IP lookup
-	uint16_t *_tbl_0_23;
-	uint16_t *_tbl_24_31;
-	VirtualPort *_vport;
-
-	// Structures used for lookup table maintenance (add/remove operations)
-	CleartextEntry *_rtable;
-	int *_rt_hashtbl; // [PREF_HASHSIZE];
-	uint8_t *_tbl_0_23_plen;
-	uint8_t *_tbl_24_31_plen;
-
-	uint32_t _rtable_size;
-	uint32_t _tbl_24_31_size;
-	uint32_t _vport_size;
-	int _rt_empty_head;
-	uint16_t _tbl_24_31_empty_head;
-	int _vport_head;
-	int _vport_empty_head;
-
-	uint32_t _rtable_capacity;
-	uint32_t _tbl_24_31_capacity;
-	uint32_t _vport_capacity;
-
-	Table()
-	    : _tbl_0_23(0), _tbl_24_31(0), _vport(0), _rtable(0),
-	      _rt_hashtbl(0), _tbl_0_23_plen(0), _tbl_24_31_plen(0) {
-	}
-
-	~Table() {
-	    cleanup();
-	}
-
-	int initialize();
-	void cleanup();
-
-	static inline uint32_t prefix_hash(uint32_t, uint32_t);
-
-	int find_entry(uint32_t, uint32_t) const;
-	String dump() const;
-
-	int vport_find(IPAddress gw, int16_t port);
-	void vport_unref(uint16_t);
+	int initialize(ErrorHandler *);
+	void add_handlers();
 
 	int add_route(const IPRoute&, bool, IPRoute*, ErrorHandler *);
 	int remove_route(const IPRoute&, IPRoute*, ErrorHandler *);
-	void flush();
+	int lookup_route(IPAddress, IPAddress&) const;
 
-    };
+	void run_timer(Timer *);
 
-  protected:
+	/* Called from pure C, so those two need to be public */
+	int dir_walk(struct radix_node *, uint32_t);
+	void bench_thread(void *);
 
-    Table _t;
+    protected:
 
-    friend class RangeIPLookup;
+	struct dir_range_entry {
+		uint32_t start;
+		uint32_t nexthop;
+	};
 
+	struct dir_heap_entry {
+		uint32_t start;
+		uint32_t end;
+		uint16_t preflen;
+		uint16_t nexthop;
+	};
+
+	/* Lookup structures */
+	uint16_t *_primary;
+	uint16_t *_secondary;
+
+	/* Auxiliary structures */
+	struct dir_heap_entry _dir_heap[33];
+	struct dir_range_entry *_range_buf;
+	int _heap_index;
+	uint32_t _range_fragments;
+	uint32_t _secondary_used;
+	uint32_t _secondary_free_head;
+
+	int _updates_pending;
+	uint32_t *_pending_bitmask;
+	uint32_t _pending_start;
+	uint32_t _pending_end;
+	uint32_t _last_update_us;
+	Timer _update_scanner;
+
+	int _bench_sel;
+	int _bench_threads;
+
+	int lookup_nexthop(uint32_t) const;
+	void schedule_update(const IPRoute &);
+	void apply_pending(void);
+	void update_chunk(uint32_t);
+	void dir_initheap(uint32_t);
+	void dir_heap_inject(uint32_t, uint32_t, int, int);
+	void flush_table();
+	static int flush_handler(const String &, Element *, void *,
+	    ErrorHandler *);
+	static String status_handler(Element *, void *);
+	static String bench_handler(Element *, void *);
+	static int bench_select(const String &, Element *, void *,
+	    ErrorHandler *);
+	static int thread_select(const String &, Element *, void *,
+	    ErrorHandler *);
+	void bench_seq(uint32_t *, uint16_t *, uint32_t);
+	void bench_rnd(uint32_t *, uint16_t *, uint32_t);
+	void bench_rep(uint32_t *, uint16_t *, uint32_t);
+	String status();
 };
 
 CLICK_ENDDECLS
