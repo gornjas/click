@@ -22,7 +22,7 @@
 #include "dxriplookup.hh"
 
 #include <err.h>
-#if defined(FreeBSD)
+#if defined(__FreeBSD__)
 #include <pthread_np.h>
 #else
 #include <pthread.h>
@@ -1106,7 +1106,7 @@ DXRIPLookup::thread_select(const String &s, Element *e, void *,
 {
 	DXRIPLookup *t = static_cast<DXRIPLookup *>(e);
 	int i, n, ncpus;
-#if defined(FreeBSD)
+#if defined(__FreeBSD__)
 	cpuset_t cpuset;
 #else
 	cpu_set_t cpuset;
@@ -1224,7 +1224,7 @@ DXRIPLookup::bench_handler(Element *e, void *)
 	uint64_t klps, len = t->_test_blk;
 	struct bench_info bi[16];
 	Timestamp t_len;
-#if defined(FreeBSD)
+#if defined(__FreeBSD__)
 	cpuset_t cpuset;
 #else
 	cpu_set_t cpuset;
