@@ -596,6 +596,8 @@ bench_trampoline(void *arg)
 	struct bench_info *bi = (struct bench_info *) arg;
 
 	bi->t->bench_thread(bi);
+
+	return (NULL); // appease compiler warnings
 }
 
 
