@@ -1210,7 +1210,7 @@ DXRIPLookup::prepare_handler(const String &s, Element *e, void *,
     ErrorHandler *)
 {
 	DXRIPLookup *t = static_cast<DXRIPLookup *>(e);
-	int n, key;
+	uint32_t n, key;
 	size_t i;
 
 	if (t->_key_tbl != NULL)
@@ -1238,8 +1238,9 @@ DXRIPLookup::prepare_handler(const String &s, Element *e, void *,
 	for (i = 0; i < t->_test_blk; i++) {
 		/* Exclude unannounced address space for tests 3, 4 and 5 */
 		do {
-			key = random();
-		} while (t->_bench_sel > 3 && t->lookup_nexthop(key) == 0);
+			key = random() << 1;
+		} while (key >> 24 == 0 || key >> 24 == 127 || key >> 24 >= 224
+		    || (t->_bench_sel > 3 && t->lookup_nexthop(key) == 0));
 		t->_key_tbl[i] = key;
 		/* map the memory for the results now, not during the test */
 		t->_nh_tbl[i] = key;

@@ -636,7 +636,8 @@ DirectIPLookup::bench_handler(Element *e, void *)
 	StringAccum sa;
 	uint32_t *key_tbl;
 	uint16_t *nh_tbl;
-	int i, key, time_ms;
+	uint32_t key;
+	int i, time_ms;
 	uint64_t klps, len = TEST_BLK;
 	struct bench_info bi[16];
 	Timestamp t_len;
@@ -651,8 +652,9 @@ DirectIPLookup::bench_handler(Element *e, void *)
 	for (i = 0; i < TEST_BLK; i++) {
 		/* Exclude unannounced address space for tests 3, 4 and 5 */
 		do {
-			key = random();
-		} while (t->_bench_sel > 3 && t->lookup_nexthop(key) == 0);
+			key = random() << 1;
+		} while (key >> 24 == 0 || key >> 24 == 127 || key >> 24 >= 224
+		    || (t->_bench_sel > 3 && t->lookup_nexthop(key) == 0));
 		key_tbl[i] = key;
 		/* map the memory for the results now, not during the test */
 		nh_tbl[i] = key;
