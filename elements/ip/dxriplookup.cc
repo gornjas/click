@@ -22,7 +22,11 @@
 #include "dxriplookup.hh"
 
 #include <err.h>
+#if defined(FreeBSD)
 #include <pthread_np.h>
+#else
+#include <pthread.h>
+#endif
 #include <sysexits.h>
 #include <unistd.h>
 
@@ -1102,7 +1106,11 @@ DXRIPLookup::thread_select(const String &s, Element *e, void *,
 {
 	DXRIPLookup *t = static_cast<DXRIPLookup *>(e);
 	int i, n, ncpus;
+#if defined(FreeBSD)
 	cpuset_t cpuset;
+#else
+	cpu_set_t cpuset;
+#endif
 
 	n = atoi(s.c_str());
 	if (pthread_getaffinity_np(pthread_self(), sizeof(cpuset), &cpuset)
@@ -1215,8 +1223,13 @@ DXRIPLookup::bench_handler(Element *e, void *)
 	int i, time_ms;
 	uint64_t klps, len = t->_test_blk;
 	struct bench_info bi[16];
-	cpuset_t cpuset;
 	Timestamp t_len;
+#if defined(FreeBSD)
+	cpuset_t cpuset;
+#else
+	cpu_set_t cpuset;
+#endif
+
 
 	if (t->_key_tbl == NULL || t->_nh_tbl == NULL) {
 		sa << "ERROR: key stream uninitialized\n";
