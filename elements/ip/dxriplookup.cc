@@ -24,6 +24,7 @@
 #include <err.h>
 #if defined(__FreeBSD__)
 #include <pthread_np.h>
+#include <pmc.h>
 #else
 #include <pthread.h>
 #endif
@@ -33,6 +34,18 @@
 #define	UNROLL_LOOKUP
 
 CLICK_DECLS
+
+#define	PMC_COUNTERS 1
+
+const char *pmc_names_intel[] = {
+	"llc-misses",
+};
+
+const char *pmc_names_amd[] = {
+	"k8-dc-refill-from-system",
+};
+
+const char **pmc_names;
 
 
 DXRIPLookup::DXRIPLookup()
@@ -46,6 +59,7 @@ DXRIPLookup::DXRIPLookup()
 	_key_tbl(NULL), _nh_tbl(NULL)
 {
 	int i;
+	pmc_id_t pmcid;
 
 	LIST_INIT(&_all_chunks);
 	LIST_INIT(&_unused_chunks);
@@ -72,6 +86,17 @@ DXRIPLookup::DXRIPLookup()
 	memset(_cptbl, 0, sizeof(*_cptbl) * DIRECT_TBL_SIZE);
 	memset(_chunk_hashtbl, 0, sizeof(*_chunk_hashtbl) * CHUNK_HASH_SIZE);
 	memset(_pending_bitmask, 0, sizeof(uint32_t) * (DIRECT_TBL_SIZE >> 5));
+
+	if (pmc_init() != 0)
+		err(EX_OSERR, "hwpmc(4) not loaded");
+
+	if (pmc_allocate(pmc_names_amd[0], PMC_MODE_SC, 0, 0, &pmcid) == 0)
+	    pmc_names = pmc_names_amd;
+	else if (pmc_allocate(pmc_names_intel[0], PMC_MODE_SC, 0, 0, &pmcid)
+	    == 0)
+	    pmc_names = pmc_names_intel;
+	else
+		err(EX_OSERR, "failed to allocate pmcs");
 }
 
 
@@ -1157,11 +1182,12 @@ DXRIPLookup::thread_select(const String &s, Element *e, void *,
 struct bench_info {
 	DXRIPLookup *t;
 	pthread_t td;
-	int id;
+	int cpu;
 	int done;
 	uint32_t *key_tbl;
 	uint16_t *nh_tbl;
 	Timestamp t_start, t_len;
+	uint64_t pmc[16];
 	char pad[128]; /* XXX padding to fill cache line? */
 };
 
@@ -1176,17 +1202,30 @@ bench_trampoline(void *arg)
 	return (NULL); // Appease compiler warnings
 }
 
-
-#define TEST_BLK (256 * 1024 * 1024)
-
 void
 DXRIPLookup::bench_thread(void *arg)
 {
 	struct bench_info *bi = (struct bench_info *) arg;
 	Timestamp t_start;
 	uint32_t off;
+	int i;
+	pmc_id_t pmcid[PMC_COUNTERS];
 
-	off = ((bi->t->_test_blk / bi->t->_bench_threads) & ~0xf) * bi->id;
+	for (i = 0; i < PMC_COUNTERS; i++) {
+		if (pmc_allocate(pmc_names[i], PMC_MODE_SC,
+		    0, bi->cpu, &pmcid[i]) < 0)
+			err(EX_OSERR, "failed to allocate pmc %s",
+			    pmc_names[i]);
+		if (pmc_write(pmcid[i], 0) < 0)
+			err(EX_OSERR, "failed to zero counter %s",
+			    pmc_names[i]);
+		if (pmc_start(pmcid[i]) < 0)
+			err(EX_OSERR, "failed to start counter %s",
+			    pmc_names[i]);
+	}
+
+	off = ((bi->t->_test_blk / bi->t->_bench_threads) & ~0xf) * bi->cpu;
+
 	/* Do the benchmark */
 	t_start = Timestamp::now();
 	switch (_bench_sel % 3) {
@@ -1202,6 +1241,14 @@ DXRIPLookup::bench_thread(void *arg)
 	};
 	bi->t_len = Timestamp::now() - t_start;
 	bi->done = 1;
+
+	for (i = 0; i < PMC_COUNTERS; i++) {
+		if (pmc_read(pmcid[i], &bi->pmc[i]) < 0)
+			err(EX_OSERR, "failed to read counter %s",
+			    pmc_names[i]);
+		if (pmc_release(pmcid[i]) < 0)
+			err(EX_OSERR, "failed to release %s", pmc_names[i]);
+	}
 }
 
 
@@ -1272,13 +1319,9 @@ DXRIPLookup::bench_handler(Element *e, void *)
 
 	for (i = 0; i < t->_bench_threads; i++) {
 		bi[i].t = t;
-		bi[i].id = i;
 		bi[i].key_tbl = t->_key_tbl;
 		bi[i].nh_tbl = t->_nh_tbl;
 		bi[i].done = 0;
-		if (pthread_create(&bi[i].td, NULL, bench_trampoline,
-		    (void *) &bi[i]) == -1)
-			err(EX_OSERR, "Can't start RX threads");
 		CPU_ZERO(&cpuset);
 		if (t->_skip_smt) {
 			cpu = i * 2;
@@ -1286,6 +1329,10 @@ DXRIPLookup::bench_handler(Element *e, void *)
 				cpu = cpu % t->_ncpus + 1;
 		} else
 			cpu = i;
+		bi[i].cpu = cpu;
+		if (pthread_create(&bi[i].td, NULL, bench_trampoline,
+		    (void *) &bi[i]) == -1)
+			err(EX_OSERR, "Can't start RX threads");
 		CPU_SET(cpu, &cpuset);
 		if (pthread_setaffinity_np(bi[i].td, sizeof(cpuset),
 		    &cpuset) != 0)
@@ -1299,12 +1346,22 @@ DXRIPLookup::bench_handler(Element *e, void *)
 				break;
 	} while (i < t->_bench_threads);
 
-	t_len = bi[0].t_len;
-	for (i = 1; i < t->_bench_threads; i++)
-		t_len = t_len + bi[i].t_len;
-	t_len = t_len / t->_bench_threads;
-	time_ms = t_len.sec() * 1000 + t_len.usec() / 1000;
-	klps = len * t->_bench_threads / time_ms;
+	sa << "# CPU s ";
+	for (int j = 0; j < PMC_COUNTERS; j++) {
+		sa << pmc_names[j] << " ";
+		sa << pmc_names[j] << "/s ";
+	}
+	sa << "\n";
+	for (i = 0; i < t->_bench_threads; i++) {
+		time_ms = bi[i].t_len.sec() * 1000 + bi[i].t_len.usec() / 1000;
+		sa << bi[i].cpu << " ";
+		sa << bi[i].t_len << " ";
+		for (int j = 0; j < PMC_COUNTERS; j++) {
+			sa << bi[i].pmc[j] << " ";
+			sa << bi[i].pmc[j] * 1000 / time_ms << " ";
+		}
+		sa << "\n";
+	}
 
 	sa << t->class_name() << " (D" << DXR_DIRECT_BITS << "R), ";
 	switch (t->_bench_sel % 3) {
@@ -1322,6 +1379,14 @@ DXRIPLookup::bench_handler(Element *e, void *)
 		sa << "random keys from announced address space:\n";
 	else
 		sa << "uniformly random keys:\n";
+
+	t_len = bi[0].t_len;
+	for (i = 1; i < t->_bench_threads; i++)
+		t_len += bi[i].t_len;
+	time_ms = t_len.sec() * 1000 + t_len.usec() / 1000;
+	time_ms /= t->_bench_threads;
+	klps = len * t->_bench_threads / time_ms;
+
 	sa << len * t->_bench_threads << " lookups in " << t_len << " s (";
 	sa << klps / 1000 << "." << (klps % 1000) / 100 << " MLps)\n";
 
