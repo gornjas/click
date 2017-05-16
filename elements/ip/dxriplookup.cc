@@ -37,15 +37,15 @@ CLICK_DECLS
 
 #define	PMC_COUNTERS 1
 
-const char *pmc_names_intel[] = {
+static const char *pmc_names_intel[] = {
 	"llc-misses",
 };
 
-const char *pmc_names_amd[] = {
+static const char *pmc_names_amd[] = {
 	"dc-refill-from-system",
 };
 
-const char **pmc_names;
+static const char **pmc_names;
 
 
 DXRIPLookup::DXRIPLookup()

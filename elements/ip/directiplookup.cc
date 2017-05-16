@@ -21,18 +21,45 @@
 #include <click/straccum.hh>
 #include "directiplookup.hh"
 
+#include <err.h>
+#if defined(__FreeBSD__)
+#include <pthread_np.h>
+#include <pmc.h>
+#else
 #include <pthread.h>
+#endif
+#include <sysexits.h>
 #include <unistd.h>
 
 CLICK_DECLS
+
+#define	PMC_COUNTERS 1
+
+static const char *pmc_names_intel[] = {
+	"llc-misses",
+};
+
+static const char *pmc_names_amd[] = {
+	"dc-refill-from-system",
+};
+
+static const char **pmc_names;
 
 
 DirectIPLookup::DirectIPLookup()
 	: _secondary_used(0), _secondary_free_head(0),
 	_updates_pending(0), _pending_start(DIR_CHUNKS),
-	_pending_end(0), _update_scanner(this), _bench_sel(0),
-	_bench_threads(1)
+	_pending_end(0), _update_scanner(this),
+	_bench_sel(0), _bench_threads(1), _skip_smt(0),
+	_key_tbl(NULL), _nh_tbl(NULL)
 {
+	int i, ncpus;
+	pmc_id_t pmcid;
+#if defined(__FreeBSD__)
+	cpuset_t cpuset;
+#else
+	cpu_set_t cpuset;
+#endif
 
 	_primary = (uint16_t *)
 	    CLICK_LALLOC(sizeof(*_primary) * PRIMARY_SIZE);
@@ -46,8 +73,27 @@ DirectIPLookup::DirectIPLookup()
 	assert(_secondary != NULL);
 	memset(_primary, 0xff, sizeof(*_primary) * PRIMARY_SIZE);
 	/* Link all secondary blocks in a free list */
-	for (int i = 0; i < (1 << 15); i ++)
+	for (i = 0; i < (1 << 15); i ++)
 		_secondary[i << SECONDARY_BITS] = i + 1;
+
+	if (pthread_getaffinity_np(pthread_self(), sizeof(cpuset), &cpuset)
+	    != 0)
+		err(EX_OSERR, "pthread_getaffinity_np() failed");
+	for (ncpus = 0, i = 0; i < CPU_SETSIZE; i++)
+		if (CPU_ISSET(i, &cpuset))
+			ncpus++;
+	_ncpus = ncpus;
+
+	if (pmc_init() != 0)
+		err(EX_OSERR, "hwpmc(4) not loaded");
+
+	if (pmc_allocate(pmc_names_amd[0], PMC_MODE_SC, 0, 0, &pmcid) == 0)
+		pmc_names = pmc_names_amd;
+	else if (pmc_allocate(pmc_names_intel[0], PMC_MODE_SC, 0, 0, &pmcid)
+	    == 0)
+		pmc_names = pmc_names_intel;
+	else
+		err(EX_OSERR, "failed to allocate pmcs");
 }
 
 
@@ -70,7 +116,9 @@ DirectIPLookup::add_handlers()
 	add_read_handler("stat", status_handler, 0, Handler::BUTTON);
 	add_read_handler("bench", bench_handler, 0, Handler::BUTTON);
 	add_write_handler("bench_sel", bench_select, 0, Handler::BUTTON);
+	add_write_handler("prepare", prepare_handler, 0, Handler::BUTTON);
 	add_write_handler("threads", thread_select, 0, Handler::BUTTON);
+	add_write_handler("skip_smt", skip_smt, 0, Handler::BUTTON);
 }
 
 
@@ -555,10 +603,33 @@ DirectIPLookup::bench_select(const String &s, Element *e, void *,
 	DirectIPLookup *t = static_cast<DirectIPLookup *>(e);
 	int type;
 	
+	if (t->_key_tbl != NULL)
+		CLICK_LFREE(t->_key_tbl, sizeof(*t->_key_tbl) * t->_test_blk);
+	if (t->_nh_tbl != NULL)
+		CLICK_LFREE(t->_nh_tbl, sizeof(*t->_nh_tbl) * t->_test_blk);
+	t->_key_tbl = NULL;
+	t->_nh_tbl = NULL;
+	t->_test_blk = 0;
+
 	type = atoi(s.c_str());
 	if (type < 0 || type > 5)
 		return (-ERANGE);
 	t->_bench_sel = type;
+	return (0);
+}
+
+
+int
+DirectIPLookup::skip_smt(const String &s, Element *e, void *,
+    ErrorHandler *)
+{
+	DirectIPLookup *t = static_cast<DirectIPLookup *>(e);
+	int type;
+
+	type = atoi(s.c_str());
+	if (type < 0 || type > 1)
+		return (-ERANGE);
+	t->_skip_smt = type;
 	return (0);
 }
 
@@ -571,7 +642,7 @@ DirectIPLookup::thread_select(const String &s, Element *e, void *,
 	int n;
 	
 	n = atoi(s.c_str());
-	if (n < 1 || n > 16)
+	if (n < 1 || n > t->_ncpus)
 		return (-ERANGE);
 	t->_bench_threads = n;
 	return (0);
@@ -581,11 +652,14 @@ DirectIPLookup::thread_select(const String &s, Element *e, void *,
 struct bench_info {
 	DirectIPLookup *t;
 	pthread_t td;
-	int id;
-	int done;
+	int index;
+	int cpu;
+	volatile int done;
 	uint32_t *key_tbl;
 	uint16_t *nh_tbl;
 	Timestamp t_start, t_len;
+	uint64_t lookups;
+	uint64_t pmc[16];
 	char pad[128]; /* XXX padding to fill cache line? */
 };
 
@@ -601,94 +675,161 @@ bench_trampoline(void *arg)
 }
 
 
-#define TEST_BLK (256 * 1024 * 1024)
-
 void
 DirectIPLookup::bench_thread(void *arg)
 {
 	struct bench_info *bi = (struct bench_info *) arg;
 	Timestamp t_start;
 	uint32_t off;
+	int i;
+	pmc_id_t pmcid[PMC_COUNTERS];
 
-	off = ((TEST_BLK / bi->t->_bench_threads) & ~0xf) * bi->id;
+	for (i = 0; i < PMC_COUNTERS; i++) {
+		if (pmc_allocate(pmc_names[i], PMC_MODE_SC,
+		    0, bi->cpu, &pmcid[i]) < 0)
+			err(EX_OSERR, "failed to allocate pmc %s",
+			    pmc_names[i]);
+		if (pmc_write(pmcid[i], 0) < 0)
+			err(EX_OSERR, "failed to zero counter %s",
+			    pmc_names[i]);
+		if (pmc_start(pmcid[i]) < 0)
+			err(EX_OSERR, "failed to start counter %s",
+			    pmc_names[i]);
+	}
+
+	off = ((bi->t->_test_blk / bi->t->_bench_threads) & ~0xf) * bi->index;
+
+	/* Wait for the start marker */
+	do {} while (_bench_active == 0);
+
 	/* Do the benchmark */
 	t_start = Timestamp::now();
 	switch (_bench_sel % 3) {
 	case 0:
-		bench_seq(bi->key_tbl, bi->nh_tbl, off);
+		bi->lookups = bench_seq(bi->key_tbl, bi->nh_tbl, off);
 		break;
 	case 1:
-		bench_rnd(bi->key_tbl, bi->nh_tbl, off);
+		bi->lookups = bench_rnd(bi->key_tbl, bi->nh_tbl, off);
 		break;
 	case 2:
-		bench_rep(bi->key_tbl, bi->nh_tbl, off);
+		bi->lookups = bench_rep(bi->key_tbl, bi->nh_tbl, off);
 		break;
 	};
 	bi->t_len = Timestamp::now() - t_start;
+
+	for (i = 0; i < PMC_COUNTERS; i++) {
+		if (pmc_read(pmcid[i], &bi->pmc[i]) < 0)
+			err(EX_OSERR, "failed to read counter %s",
+			    pmc_names[i]);
+		if (pmc_release(pmcid[i]) < 0)
+			err(EX_OSERR, "failed to release %s", pmc_names[i]);
+	}
+
 	bi->done = 1;
 }
 
+
+int
+DirectIPLookup::prepare_handler(const String &s, Element *e, void *,
+    ErrorHandler *)
+{
+	DirectIPLookup *t = static_cast<DirectIPLookup *>(e);
+	uint32_t n, key;
+	size_t i;
+
+	if (t->_key_tbl != NULL)
+		CLICK_LFREE(t->_key_tbl, sizeof(*t->_key_tbl) * t->_test_blk);
+	if (t->_nh_tbl != NULL)
+		CLICK_LFREE(t->_nh_tbl, sizeof(*t->_nh_tbl) * t->_test_blk);
+	t->_key_tbl = NULL;
+	t->_nh_tbl = NULL;
+	t->_test_blk = 0;
+
+	n = atoi(s.c_str());
+	if (n < 1 || n > 1024)
+		return (ERANGE);
+
+	t->_test_blk = n * 1024 * 1024;
+
+	t->_key_tbl =
+	    (uint32_t *) CLICK_LALLOC(sizeof(*t->_key_tbl) * t->_test_blk);
+	t->_nh_tbl =
+	    (uint16_t *) CLICK_LALLOC(sizeof(*t->_nh_tbl) * t->_test_blk);
+	assert(t->_key_tbl != NULL);
+	assert(t->_nh_tbl != NULL);
+
+	/* Populate input vector with random keys */
+	for (i = 0; i < t->_test_blk; i++) {
+		/* Exclude unannounced address space for tests 3, 4 and 5 */
+		do {
+			key = random() << 1;
+		} while (key >> 24 == 0 || key >> 24 == 127 || key >> 24 >= 224
+		    || (t->_bench_sel > 3 && t->lookup_nexthop(key) == 0));
+		t->_key_tbl[i] = key;
+		/* map the memory for the results now, not during the test */
+		t->_nh_tbl[i] = key;
+	}
+
+	return (0);
+}
 
 String
 DirectIPLookup::bench_handler(Element *e, void *)
 {
 	DirectIPLookup *t = static_cast<DirectIPLookup *>(e);
 	StringAccum sa;
-	uint32_t *key_tbl;
-	uint16_t *nh_tbl;
-	uint32_t key;
-	int i, time_ms;
-	uint64_t klps, len = TEST_BLK;
-	struct bench_info bi[16];
+	int i, time_ms, cpu;
+	struct bench_info bi[256]; // XXX
 	Timestamp t_len;
- 
-	key_tbl = (uint32_t *) CLICK_LALLOC(sizeof(*key_tbl) * TEST_BLK);
-	nh_tbl = (uint16_t *) CLICK_LALLOC(sizeof(*nh_tbl) * TEST_BLK);
-	assert(key_tbl != NULL);
-	assert(nh_tbl != NULL);
+	uint64_t klps, lookups, pmc;
+#if defined(__FreeBSD__)
+	cpuset_t cpuset;
+#else
+	cpu_set_t cpuset;
+#endif
 
-	/* Populate input vector with random keys */
-	printf("%s: preparing random keys, please wait...\n", __FUNCTION__);
-	for (i = 0; i < TEST_BLK; i++) {
-		/* Exclude unannounced address space for tests 3, 4 and 5 */
-		do {
-			key = random() << 1;
-		} while (key >> 24 == 0 || key >> 24 == 127 || key >> 24 >= 224
-		    || (t->_bench_sel > 3 && t->lookup_nexthop(key) == 0));
-		key_tbl[i] = key;
-		/* map the memory for the results now, not during the test */
-		nh_tbl[i] = key;
+	if (t->_key_tbl == NULL || t->_nh_tbl == NULL) {
+		sa << "ERROR: key stream uninitialized\n";
+		return (sa.take_string());
 	}
-	printf("Keys prepared, starting %d worker thread(s)...\n",
-	    t->_bench_threads);
 
 	for (i = 0; i < t->_bench_threads; i++) {
+		bi[i].index = i;
 		bi[i].t = t;
-		bi[i].id = i;
-		bi[i].key_tbl = key_tbl;
-		bi[i].nh_tbl = nh_tbl;
+		bi[i].key_tbl = t->_key_tbl;
+		bi[i].nh_tbl = t->_nh_tbl;
 		bi[i].done = 0;
-		pthread_create(&bi[i].td, NULL, bench_trampoline,
-		    (void *) &bi[i]);
+		CPU_ZERO(&cpuset);
+		if (t->_skip_smt) {
+			cpu = i * 2;
+			if (cpu >= t->_ncpus)
+				cpu = cpu % t->_ncpus + 1;
+		} else
+			cpu = i;
+		bi[i].cpu = cpu;
+		if (pthread_create(&bi[i].td, NULL, bench_trampoline,
+		    (void *) &bi[i]) == -1)
+			err(EX_OSERR, "Can't start RX threads");
+		CPU_SET(cpu, &cpuset);
+		if (pthread_setaffinity_np(bi[i].td, sizeof(cpuset),
+		    &cpuset) != 0)
+			err(EX_OSERR, "pthread_setaffinity_np() failed");
 	}
 
+	usleep(10000);
+
+	t->_bench_active = 1;
+	sleep(10);
+	t->_bench_active = 0;
+
 	do {
-		sleep(1);
+		usleep(10000);
 		for (i = 0; i < t->_bench_threads; i++)
 			if (bi[i].done == 0)
 				break;
 	} while (i < t->_bench_threads);
 
-	t_len = bi[0].t_len;
-	for (i = 1; i < t->_bench_threads; i++)
-		t_len = t_len + bi[i].t_len;
-	t_len = t_len / t->_bench_threads;
-	time_ms = t_len.sec() * 1000 + t_len.usec() / 1000;
-	klps = len * t->_bench_threads / time_ms;
-	printf("Benchmark completed in %d s %d ms.\n", t_len.sec(),
-	    t_len.msec());
-
-	sa << t->class_name() << " (DIR-" << DIRECT_BITS << "-" <<
+	sa << "# " << t->class_name() << " (DIR-" << DIRECT_BITS << "-" <<
 	    SECONDARY_BITS << "), ";
 	switch (t->_bench_sel % 3) {
 	case 0:
@@ -705,22 +846,68 @@ DirectIPLookup::bench_handler(Element *e, void *)
 		sa << "random keys from announced address space:\n";
 	else
 		sa << "uniformly random keys:\n";
-	sa << len * t->_bench_threads << " lookups in " << t_len << " s (";
-	sa << klps / 1000 << "." << (klps % 1000) / 100 << " MLps)\n";
 
-	CLICK_LFREE(key_tbl, sizeof(*key_tbl) * TEST_BLK);
-	CLICK_LFREE(nh_tbl, sizeof(*nh_tbl) * TEST_BLK);
+	sa << "# thread CPU time(s) ML MLps ";
+	for (int j = 0; j < PMC_COUNTERS; j++) {
+		sa << "M" << pmc_names[j] << " ";
+		sa << "M" << pmc_names[j] << "/s ";
+	}
+	sa << "\n";
+
+	for (i = 0; i < t->_bench_threads; i++) {
+		time_ms = bi[i].t_len.sec() * 1000 + bi[i].t_len.usec() / 1000;
+		sa << i << " ";
+		sa << bi[i].cpu << " ";
+		sa << bi[i].t_len << " ";
+		sa << bi[i].lookups / 1000000.0 << " ";
+		sa << bi[i].lookups / 1000.0 / time_ms << " ";
+		for (int j = 0; j < PMC_COUNTERS; j++) {
+			sa << bi[i].pmc[j] / 1000000.0 << " ";
+			sa << bi[i].pmc[j] / 1000.0 / time_ms << " ";
+		}
+		sa << "\n";
+	}
+
+	t_len = bi[0].t_len;
+	lookups = bi[0].lookups;
+	pmc = bi[0].pmc[0];
+	for (i = 1; i < t->_bench_threads; i++) {
+		t_len += bi[i].t_len;
+		lookups += bi[i].lookups;
+		pmc += bi[i].pmc[0];
+	}
+	time_ms = t_len.sec() * 1000 + t_len.usec() / 1000;
+	time_ms /= t->_bench_threads;
+	klps = lookups / time_ms;
+
+	sa << "# System: " << t->_bench_threads << " ";
+	sa << t_len / t->_bench_threads << " ";
+	sa << lookups / 1000000.0 << " ";
+	sa << lookups / 1000.0 / time_ms << " ";
+	sa << pmc / 1000000.0 << " ";
+	sa << pmc / 1000.0 / time_ms << " ";
+	sa << "\n";
+
+	sa << "# Summary: ";
+	sa << klps / 1000.0 << " MLps total, ";
+	sa << klps / 1000.0 / t->_bench_threads << " MLps per core.\n";
+	sa << "# " << pmc * 1.0 / lookups << " ";
+	sa << pmc_names[0] << " / lookup\n";
+
 	return (sa.take_string());
 }
 
 
-void
+#define	BENCH_LOOP 65536
+
+uint64_t
 DirectIPLookup::bench_seq(uint32_t *key_tbl, uint16_t *nh_tbl, uint32_t offset)
 {
 	int nh = 0;
-	int size = TEST_BLK;
 	uint32_t *key_ptr;
 	uint16_t *nh_ptr;
+	size_t size = 0;
+	int i;
 
 #define SEQ_STAGE							\
 	do {								\
@@ -728,61 +915,75 @@ DirectIPLookup::bench_seq(uint32_t *key_tbl, uint16_t *nh_tbl, uint32_t offset)
 		*nh_ptr++ = nh;						\
 	} while (0)
 
-	while (size > 0) {
+	do {
+	    for (i = 0; i < BENCH_LOOP; i++) {
 		key_ptr = &key_tbl[offset];
 		nh_ptr = &nh_tbl[offset];
 		offset += 8;
-		if (offset >= TEST_BLK)
+		if (offset >= _test_blk)
 			offset = 0;
 		/* Manual unrolling for better throughput */
 		SEQ_STAGE; SEQ_STAGE; SEQ_STAGE; SEQ_STAGE;
 		SEQ_STAGE; SEQ_STAGE; SEQ_STAGE; SEQ_STAGE;
-		size -= 8;
-	}
+		size += 8;
+	    }
+	} while (_bench_active);
+
+	return (size);
 }
 
 
-void
+uint64_t
 DirectIPLookup::bench_rnd(uint32_t *key_tbl, uint16_t *nh_tbl, uint32_t offset)
 {
-	int size = TEST_BLK;
 	uint32_t *key_ptr;
 	uint16_t *nh_ptr;
+	size_t size = 0;
+	int i;
 
 #define RND_STAGE do {*nh_ptr++ = lookup_nexthop(*key_ptr++);} while (0)
 
-	while (size > 0) {
+	do {
+	    for (i = 0; i < BENCH_LOOP; i++) {
 		key_ptr = &key_tbl[offset];
 		nh_ptr = &nh_tbl[offset];
 		offset += 8;
-		if (offset >= TEST_BLK)
+		if (offset >= _test_blk)
 			offset = 0;
 		/* Manual unrolling for better throughput */
 		RND_STAGE; RND_STAGE; RND_STAGE; RND_STAGE;
 		RND_STAGE; RND_STAGE; RND_STAGE; RND_STAGE;
-		size -= 8;
-	}
+		size += 8;
+	    }
+	} while (_bench_active);
+
+	return (size);
 }
 
 
-void
+uint64_t
 DirectIPLookup::bench_rep(uint32_t *key_tbl, uint16_t *nh_tbl, uint32_t offset)
 {
-	int size = TEST_BLK;
 	uint32_t *key_ptr;
 	uint16_t *nh_ptr;
+	size_t size = 0;
+	int i;
 
-	while (size > 0) {
+	do {
+	    for (i = 0; i < BENCH_LOOP; i++) {
 		key_ptr = &key_tbl[offset];
 		nh_ptr = &nh_tbl[offset];
 		offset += 1; /* Reuse same key 8 times */
-		if (offset >= TEST_BLK - 8)
+		if (offset >= _test_blk - 8)
 			offset = 0;
 		/* Manual unrolling for better throughput */
 		RND_STAGE; RND_STAGE; RND_STAGE; RND_STAGE;
 		RND_STAGE; RND_STAGE; RND_STAGE; RND_STAGE;
-		size -= 8;
-	}
+		size += 8;
+	    }
+	} while (_bench_active);
+
+	return (size);
 }
 
 
