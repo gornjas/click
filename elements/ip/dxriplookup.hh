@@ -226,6 +226,7 @@ class DXRIPLookup : public BSDIPLookup {
 	int _bench_threads;
 	int _skip_smt;
 	int _ncpus;
+	volatile int _bench_active;
 	size_t _test_blk;
 	uint32_t *_key_tbl;
 	uint16_t *_nh_tbl;
@@ -254,9 +255,9 @@ class DXRIPLookup : public BSDIPLookup {
 	    ErrorHandler *);
 	static int prepare_handler(const String &, Element *, void *,
 	    ErrorHandler *);
-	void bench_seq(uint32_t *, uint16_t *, uint32_t);
-	void bench_rnd(uint32_t *, uint16_t *, uint32_t);
-	void bench_rep(uint32_t *, uint16_t *, uint32_t);
+	uint64_t bench_seq(uint32_t *, uint16_t *, uint32_t);
+	uint64_t bench_rnd(uint32_t *, uint16_t *, uint32_t);
+	uint64_t bench_rep(uint32_t *, uint16_t *, uint32_t);
 	String status();
 };
 

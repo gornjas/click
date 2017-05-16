@@ -58,8 +58,13 @@ DXRIPLookup::DXRIPLookup()
 	_bench_sel(0), _bench_threads(1), _skip_smt(0),
 	_key_tbl(NULL), _nh_tbl(NULL)
 {
-	int i;
+	int i, ncpus;
 	pmc_id_t pmcid;
+#if defined(__FreeBSD__)
+	cpuset_t cpuset;
+#else
+	cpu_set_t cpuset;
+#endif
 
 	LIST_INIT(&_all_chunks);
 	LIST_INIT(&_unused_chunks);
@@ -86,6 +91,14 @@ DXRIPLookup::DXRIPLookup()
 	memset(_cptbl, 0, sizeof(*_cptbl) * DIRECT_TBL_SIZE);
 	memset(_chunk_hashtbl, 0, sizeof(*_chunk_hashtbl) * CHUNK_HASH_SIZE);
 	memset(_pending_bitmask, 0, sizeof(uint32_t) * (DIRECT_TBL_SIZE >> 5));
+
+	if (pthread_getaffinity_np(pthread_self(), sizeof(cpuset), &cpuset)
+	    != 0)
+		err(EX_OSERR, "pthread_getaffinity_np() failed");
+	for (ncpus = 0, i = 0; i < CPU_SETSIZE; i++)
+		if (CPU_ISSET(i, &cpuset))
+			ncpus++;
+	_ncpus = ncpus;
 
 	if (pmc_init() != 0)
 		err(EX_OSERR, "hwpmc(4) not loaded");
@@ -1156,25 +1169,12 @@ DXRIPLookup::thread_select(const String &s, Element *e, void *,
     ErrorHandler *)
 {
 	DXRIPLookup *t = static_cast<DXRIPLookup *>(e);
-	int i, n, ncpus;
-#if defined(__FreeBSD__)
-	cpuset_t cpuset;
-#else
-	cpu_set_t cpuset;
-#endif
+	int n;
 
 	n = atoi(s.c_str());
-	if (pthread_getaffinity_np(pthread_self(), sizeof(cpuset), &cpuset)
-	    != 0)
-		err(EX_OSERR, "pthread_getaffinity_np() failed");
-	for (ncpus = 0, i = 0; i < CPU_SETSIZE; i++)
-		if (CPU_ISSET(i, &cpuset))
-			ncpus++;
-
-	if (n < 1 || n > ncpus)
+	if (n < 1 || n > t->_ncpus)
 		return (-ERANGE);
 	t->_bench_threads = n;
-	t->_ncpus = ncpus;
 	return (0);
 }
 
@@ -1182,11 +1182,13 @@ DXRIPLookup::thread_select(const String &s, Element *e, void *,
 struct bench_info {
 	DXRIPLookup *t;
 	pthread_t td;
+	int index;
 	int cpu;
-	int done;
+	volatile int done;
 	uint32_t *key_tbl;
 	uint16_t *nh_tbl;
 	Timestamp t_start, t_len;
+	uint64_t lookups;
 	uint64_t pmc[16];
 	char pad[128]; /* XXX padding to fill cache line? */
 };
@@ -1224,23 +1226,25 @@ DXRIPLookup::bench_thread(void *arg)
 			    pmc_names[i]);
 	}
 
-	off = ((bi->t->_test_blk / bi->t->_bench_threads) & ~0xf) * bi->cpu;
+	off = ((bi->t->_test_blk / bi->t->_bench_threads) & ~0xf) * bi->index;
+
+	/* Wait for the start marker */
+	do {} while (_bench_active == 0);
 
 	/* Do the benchmark */
 	t_start = Timestamp::now();
 	switch (_bench_sel % 3) {
 	case 0:
-		bench_seq(bi->key_tbl, bi->nh_tbl, off);
+		bi->lookups = bench_seq(bi->key_tbl, bi->nh_tbl, off);
 		break;
 	case 1:
-		bench_rnd(bi->key_tbl, bi->nh_tbl, off);
+		bi->lookups = bench_rnd(bi->key_tbl, bi->nh_tbl, off);
 		break;
 	case 2:
-		bench_rep(bi->key_tbl, bi->nh_tbl, off);
+		bi->lookups = bench_rep(bi->key_tbl, bi->nh_tbl, off);
 		break;
 	};
 	bi->t_len = Timestamp::now() - t_start;
-	bi->done = 1;
 
 	for (i = 0; i < PMC_COUNTERS; i++) {
 		if (pmc_read(pmcid[i], &bi->pmc[i]) < 0)
@@ -1249,6 +1253,8 @@ DXRIPLookup::bench_thread(void *arg)
 		if (pmc_release(pmcid[i]) < 0)
 			err(EX_OSERR, "failed to release %s", pmc_names[i]);
 	}
+
+	bi->done = 1;
 }
 
 
@@ -1302,15 +1308,14 @@ DXRIPLookup::bench_handler(Element *e, void *)
 	DXRIPLookup *t = static_cast<DXRIPLookup *>(e);
 	StringAccum sa;
 	int i, time_ms, cpu;
-	uint64_t klps, len = t->_test_blk;
-	struct bench_info bi[16];
+	struct bench_info bi[256]; // XXX
 	Timestamp t_len;
+	uint64_t klps, lookups, pmc;
 #if defined(__FreeBSD__)
 	cpuset_t cpuset;
 #else
 	cpu_set_t cpuset;
 #endif
-
 
 	if (t->_key_tbl == NULL || t->_nh_tbl == NULL) {
 		sa << "ERROR: key stream uninitialized\n";
@@ -1318,6 +1323,7 @@ DXRIPLookup::bench_handler(Element *e, void *)
 	}
 
 	for (i = 0; i < t->_bench_threads; i++) {
+		bi[i].index = i;
 		bi[i].t = t;
 		bi[i].key_tbl = t->_key_tbl;
 		bi[i].nh_tbl = t->_nh_tbl;
@@ -1339,31 +1345,20 @@ DXRIPLookup::bench_handler(Element *e, void *)
 			err(EX_OSERR, "pthread_setaffinity_np() failed");
 	}
 
+	usleep(10000);
+
+	t->_bench_active = 1;
+	sleep(10);
+	t->_bench_active = 0;
+
 	do {
-		sleep(1);
+		usleep(10000);
 		for (i = 0; i < t->_bench_threads; i++)
 			if (bi[i].done == 0)
 				break;
 	} while (i < t->_bench_threads);
 
-	sa << "# CPU s ";
-	for (int j = 0; j < PMC_COUNTERS; j++) {
-		sa << pmc_names[j] << " ";
-		sa << pmc_names[j] << "/s ";
-	}
-	sa << "\n";
-	for (i = 0; i < t->_bench_threads; i++) {
-		time_ms = bi[i].t_len.sec() * 1000 + bi[i].t_len.usec() / 1000;
-		sa << bi[i].cpu << " ";
-		sa << bi[i].t_len << " ";
-		for (int j = 0; j < PMC_COUNTERS; j++) {
-			sa << bi[i].pmc[j] << " ";
-			sa << bi[i].pmc[j] * 1000 / time_ms << " ";
-		}
-		sa << "\n";
-	}
-
-	sa << t->class_name() << " (D" << DXR_DIRECT_BITS << "R), ";
+	sa << "# " << t->class_name() << " (D" << DXR_DIRECT_BITS << "R), ";
 	switch (t->_bench_sel % 3) {
 	case 0:
 		sa << "SEQ test, ";
@@ -1380,27 +1375,66 @@ DXRIPLookup::bench_handler(Element *e, void *)
 	else
 		sa << "uniformly random keys:\n";
 
+	sa << "# thread CPU time(s) ML MLps ";
+	for (int j = 0; j < PMC_COUNTERS; j++) {
+		sa << "M" << pmc_names[j] << " ";
+		sa << "M" << pmc_names[j] << "/s ";
+	}
+	sa << "\n";
+
+
+	for (i = 0; i < t->_bench_threads; i++) {
+		time_ms = bi[i].t_len.sec() * 1000 + bi[i].t_len.usec() / 1000;
+		sa << i << " ";
+		sa << bi[i].cpu << " ";
+		sa << bi[i].t_len << " ";
+		sa << bi[i].lookups / 1000000.0 << " ";
+		sa << bi[i].lookups / 1000.0 / time_ms << " ";
+		for (int j = 0; j < PMC_COUNTERS; j++) {
+			sa << bi[i].pmc[j] / 1000000.0 << " ";
+			sa << bi[i].pmc[j] / 1000.0 / time_ms << " ";
+		}
+		sa << "\n";
+	}
+
 	t_len = bi[0].t_len;
-	for (i = 1; i < t->_bench_threads; i++)
+	lookups = bi[0].lookups;
+	pmc = bi[0].pmc[0];
+	for (i = 1; i < t->_bench_threads; i++) {
 		t_len += bi[i].t_len;
+		lookups += bi[i].lookups;
+		pmc += bi[i].pmc[0];
+	}
 	time_ms = t_len.sec() * 1000 + t_len.usec() / 1000;
 	time_ms /= t->_bench_threads;
-	klps = len * t->_bench_threads / time_ms;
+	klps = lookups / time_ms;
 
-	sa << len * t->_bench_threads << " lookups in " << t_len << " s (";
-	sa << klps / 1000 << "." << (klps % 1000) / 100 << " MLps)\n";
+	sa << "# System: " << t->_bench_threads << " ";
+	sa << t_len / t->_bench_threads << " ";
+	sa << lookups / 1000000.0 << " ";
+	sa << lookups / 1000.0 / time_ms << " ";
+	sa << pmc / 1000000.0 << " ";
+	sa << pmc / 1000.0 / time_ms << " ";
+	sa << "\n";
+
+	sa << "# Summary: ";
+	sa << klps / 1000 << "." << (klps % 1000) / 100 << " MLps, ";
+	sa << pmc * 1.0 / lookups << " L3 cache misses / lookup\n";
 
 	return (sa.take_string());
 }
 
 
-void
+#define	BENCH_LOOP 65536
+
+uint64_t
 DXRIPLookup::bench_seq(uint32_t *key_tbl, uint16_t *nh_tbl, uint32_t offset)
 {
 	int nh = 0;
-	int size = _test_blk;
 	uint32_t *key_ptr;
 	uint16_t *nh_ptr;
+	size_t size = 0;
+	int i;
 
 #define SEQ_STAGE							\
 	do {								\
@@ -1408,7 +1442,8 @@ DXRIPLookup::bench_seq(uint32_t *key_tbl, uint16_t *nh_tbl, uint32_t offset)
 		*nh_ptr++ = nh;						\
 	} while (0)
 
-	while (size > 0) {
+	do {
+	    for (i = 0; i < BENCH_LOOP; i++) {
 		key_ptr = &key_tbl[offset];
 		nh_ptr = &nh_tbl[offset];
 		offset += 8;
@@ -1417,21 +1452,26 @@ DXRIPLookup::bench_seq(uint32_t *key_tbl, uint16_t *nh_tbl, uint32_t offset)
 		/* Manual unrolling for better throughput */
 		SEQ_STAGE; SEQ_STAGE; SEQ_STAGE; SEQ_STAGE;
 		SEQ_STAGE; SEQ_STAGE; SEQ_STAGE; SEQ_STAGE;
-		size -= 8;
-	}
+		size += 8;
+	    }
+	} while (_bench_active);
+
+	return (size);
 }
 
 
-void
+uint64_t
 DXRIPLookup::bench_rnd(uint32_t *key_tbl, uint16_t *nh_tbl, uint32_t offset)
 {
-	int size = _test_blk;
 	uint32_t *key_ptr;
 	uint16_t *nh_ptr;
+	size_t size = 0;
+	int i;
 
 #define RND_STAGE do {*nh_ptr++ = lookup_nexthop(*key_ptr++);} while (0)
 
-	while (size > 0) {
+	do {
+	    for (i = 0; i < BENCH_LOOP; i++) {
 		key_ptr = &key_tbl[offset];
 		nh_ptr = &nh_tbl[offset];
 		offset += 8;
@@ -1440,19 +1480,24 @@ DXRIPLookup::bench_rnd(uint32_t *key_tbl, uint16_t *nh_tbl, uint32_t offset)
 		/* Manual unrolling for better throughput */
 		RND_STAGE; RND_STAGE; RND_STAGE; RND_STAGE;
 		RND_STAGE; RND_STAGE; RND_STAGE; RND_STAGE;
-		size -= 8;
-	}
+		size += 8;
+	    }
+	} while (_bench_active);
+
+	return (size);
 }
 
 
-void
+uint64_t
 DXRIPLookup::bench_rep(uint32_t *key_tbl, uint16_t *nh_tbl, uint32_t offset)
 {
-	int size = _test_blk;
 	uint32_t *key_ptr;
 	uint16_t *nh_ptr;
+	size_t size = 0;
+	int i;
 
-	while (size > 0) {
+	do {
+	    for (i = 0; i < BENCH_LOOP; i++) {
 		key_ptr = &key_tbl[offset];
 		nh_ptr = &nh_tbl[offset];
 		offset += 1; /* Reuse same key 8 times */
@@ -1461,8 +1506,11 @@ DXRIPLookup::bench_rep(uint32_t *key_tbl, uint16_t *nh_tbl, uint32_t offset)
 		/* Manual unrolling for better throughput */
 		RND_STAGE; RND_STAGE; RND_STAGE; RND_STAGE;
 		RND_STAGE; RND_STAGE; RND_STAGE; RND_STAGE;
-		size -= 8;
-	}
+		size += 8;
+	    }
+	} while (_bench_active);
+
+	return (size);
 }
 
 
