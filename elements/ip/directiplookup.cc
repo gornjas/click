@@ -759,6 +759,7 @@ DirectIPLookup::prepare_handler(const String &s, Element *e, void *,
 	assert(t->_nh_tbl != NULL);
 
 	/* Populate input vector with random keys */
+	srandomdev();
 	for (i = 0; i < t->_test_blk; i++) {
 		/* Exclude unannounced address space for tests 3, 4 and 5 */
 		do {
