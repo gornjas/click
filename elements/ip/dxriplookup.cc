@@ -42,7 +42,7 @@ const char *pmc_names_intel[] = {
 };
 
 const char *pmc_names_amd[] = {
-	"k8-dc-refill-from-system",
+	"dc-refill-from-system",
 };
 
 const char **pmc_names;
@@ -1418,8 +1418,10 @@ DXRIPLookup::bench_handler(Element *e, void *)
 	sa << "\n";
 
 	sa << "# Summary: ";
-	sa << klps / 1000 << "." << (klps % 1000) / 100 << " MLps, ";
-	sa << pmc * 1.0 / lookups << " L3 cache misses / lookup\n";
+	sa << klps / 1000.0 << " MLps total, ";
+	sa << klps / 1000.0 / t->_bench_threads << " MLps per core.\n";
+	sa << "# " << pmc * 1.0 / lookups << " ";
+	sa << pmc_names[0] << " / lookup\n";
 
 	return (sa.take_string());
 }
